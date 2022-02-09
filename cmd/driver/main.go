@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"io/ioutil"
 	"net"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +13,7 @@ import (
 	"github.com/go-kit/kit/log/level"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/hetznercloud/hcloud-go/hcloud"
+	"github.com/hetznercloud/hcloud-go/hcloud/metadata"
 	"google.golang.org/grpc"
 
 	"github.com/hetznercloud/csi-driver/api"
@@ -79,7 +78,7 @@ func main() {
 		opts = append(opts, hcloud.WithDebugWriter(os.Stdout))
 	}
 
-	pollingInterval := 1
+	pollingInterval := 3
 	if customPollingInterval := os.Getenv("HCLOUD_POLLING_INTERVAL_SECONDS"); customPollingInterval != "" {
 		tmp, err := strconv.Atoi(customPollingInterval)
 		if err != nil || tmp < 1 {
@@ -97,16 +96,29 @@ func main() {
 	}
 	opts = append(opts, hcloud.WithPollInterval(time.Duration(pollingInterval)*time.Second))
 
+	metricsEndpoint := os.Getenv("METRICS_ENDPOINT")
+	if metricsEndpoint == "" {
+		// Use a default endpoint
+		metricsEndpoint = ":9189"
+	}
+
+	m := metrics.New(
+		log.With(logger, "component", "metrics-service"),
+		metricsEndpoint,
+	)
+	opts = append(opts, hcloud.WithInstrumentation(m.Registry()))
+
 	hcloudClient := hcloud.NewClient(opts...)
 
-	hcloudServerID := getServerID(hcloudClient)
+	metadataClient := metadata.NewClient(metadata.WithInstrumentation(m.Registry()))
 
+	hcloudServerID := getServerID(hcloudClient, metadataClient)
 	var location string
 	var server *hcloud.Server
 
 	if hcloudServerID > -1 {
 		level.Debug(logger).Log("msg", "fetching server")
-		hcloudServer, _, err := hcloudClient.Server.GetByID(context.Background(), hcloudServerID)
+		server, _, err := hcloudClient.Server.GetByID(context.Background(), hcloudServerID)
 		if err != nil {
 			level.Error(logger).Log(
 				"msg", "failed to fetch server",
@@ -114,10 +126,17 @@ func main() {
 			)
 			os.Exit(1)
 		}
-		level.Info(logger).Log("msg", "fetched server", "server-name", hcloudServer.Name)
 
-		location = hcloudServer.Datacenter.Location.Name
-		server = hcloudServer
+		location = server.Datacenter.Location.Name
+
+		// Cover potential cases where the server is not found. This results in a
+		// nil server object and nil error. If we do not do this, we will panic
+		// when trying to log the server.Name.
+		if server == nil {
+			level.Error(logger).Log("msg", "failed to fetch server", "err", "not found")
+			os.Exit(1)
+		}
+		level.Info(logger).Log("msg", "fetched server", "server-name", server.Name)
 	} else {
 		level.Info(logger).Log("msg", "no server configured to attach volumes to")
 
@@ -178,22 +197,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	metricsEndpoint := os.Getenv("METRICS_ENDPOINT")
-	if metricsEndpoint == "" {
-		// Use a default endpoint
-		metricsEndpoint = ":9189"
-	}
-
-	metrics := metrics.New(
-		log.With(logger, "component", "metrics-service"),
-		metricsEndpoint,
-	)
-
 	grpcServer := grpc.NewServer(
 		grpc.UnaryInterceptor(
 			grpc_middleware.ChainUnaryServer(
 				requestLogger(log.With(logger, "component", "grpc-server")),
-				metrics.UnaryServerInterceptor(),
+				m.UnaryServerInterceptor(),
 			),
 		),
 	)
@@ -205,8 +213,25 @@ func main() {
 		proto.RegisterNodeServer(grpcServer, nodeService)
 	}
 
-	metrics.InitializeMetrics(grpcServer)
-	metrics.Serve()
+	m.InitializeMetrics(grpcServer)
+	enableMetrics := true // Default to true to keep the old behavior of exporting them always. This is deprecated
+	if enableMetricsEnv := os.Getenv("ENABLE_METRICS"); enableMetricsEnv != "" {
+		enableMetrics, err = strconv.ParseBool(enableMetricsEnv)
+		if err != nil {
+			level.Error(logger).Log(
+				"msg", "ENABLE_METRICS can only contain a boolean value, true or false",
+				"err", err,
+			)
+			os.Exit(1)
+		}
+	} else {
+		level.Warn(logger).Log(
+			"msg", "the environment variable ENABLE_METRICS should be set to true, you can disable metrics by setting this env to false. Not specifying the ENV is deprecated. With v1.9.0 we will change the default to false and in v1.10.0 we will fail on start when the ENABLE_METRICS is not specified.",
+		)
+	}
+	if enableMetrics {
+		m.Serve()
+	}
 
 	identityService.SetReady(true)
 
@@ -219,7 +244,7 @@ func main() {
 	}
 }
 
-func getServerID(hcloudClient *hcloud.Client) int {
+func getServerID(hcloudClient *hcloud.Client, metadataClient *metadata.Client) int {
 	var err error
 	id := -1
 
@@ -263,28 +288,14 @@ func getServerID(hcloudClient *hcloud.Client) int {
 	level.Debug(logger).Log(
 		"msg", "getting instance id from metadata service",
 	)
-	id, err = getInstanceID()
+	id, err = metadataClient.InstanceID()
 	if err != nil {
-		level.Info(logger).Log(
+		level.Debug(logger).Log(
 			"msg", "failed to get instance id from metadata service",
 			"err", err,
 		)
 	}
-
 	return id
-}
-
-func getInstanceID() (int, error) {
-	resp, err := http.Get("http://169.254.169.254/2009-04-04/meta-data/instance-id")
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-	return strconv.Atoi(string(body))
 }
 
 func parseLogLevel(lvl string) level.Option {
@@ -298,24 +309,29 @@ func parseLogLevel(lvl string) level.Option {
 	case "error":
 		return level.AllowError()
 	default:
-		return level.AllowAll()
+		return level.AllowInfo()
 	}
 }
 
 func requestLogger(logger log.Logger) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		level.Debug(logger).Log(
-			"msg", "handling request",
-			"req", req,
-		)
+		isProbe := info.FullMethod == "/csi.v1.Identity/Probe"
+
+		if !isProbe {
+			level.Debug(logger).Log(
+				"msg", "handling request",
+				"method", info.FullMethod,
+				"req", req,
+			)
+		}
 		resp, err := handler(ctx, req)
 		if err != nil {
 			level.Error(logger).Log(
 				"msg", "handler failed",
 				"err", err,
 			)
-		} else {
-			level.Debug(logger).Log("msg", "finished handling request")
+		} else if !isProbe {
+			level.Debug(logger).Log("msg", "finished handling request", "method", info.FullMethod, "err", err)
 		}
 		return resp, err
 	}

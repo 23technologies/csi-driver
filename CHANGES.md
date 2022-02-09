@@ -1,4 +1,7 @@
 # Changes
+## v1.6.0
+
+As of release v1.6.0 we moved the release notes to Github Releases: https://github.com/hetznercloud/csi-driver/releases
 
 ## v1.5.2
 
